@@ -1,75 +1,134 @@
 name: CD For SiYuan Unlock
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "release version/tag"
-        required: true
-      packageManager:
-        description: "pnpm@x.x.x"
-        required: true
+        description: "release version/tag; blank uses latest upstream stable release"
+        required: false
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      package_manager: ${{ steps.metadata.outputs.package_manager }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: siyuan-note
+
+      - name: Resolve upstream release and validate patches
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          version="${REQUESTED_VERSION}"
+          if [ -z "${version}" ]; then
+            version="$(gh api repos/siyuan-note/siyuan/releases/latest --jq .tag_name)"
+          fi
+
+          git clone --branch "${version}" --depth=1 https://github.com/siyuan-note/siyuan.git upstream
+
+          package_version="$(jq -r .version upstream/app/package.json)"
+          package_manager="$(jq -r .packageManager upstream/app/package.json)"
+          if [ "${version}" != "v${package_version}" ]; then
+            echo "Tag ${version} does not match app/package.json version ${package_version}" >&2
+            exit 1
+          fi
+
+          for patch in siyuan-note/patches/siyuan/*.patch; do
+            git -C upstream apply --check "${GITHUB_WORKSPACE}/${patch}"
+          done
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "package_manager=${package_manager}" >> "${GITHUB_OUTPUT}"
+
   build:
+    needs: prepare
+    name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
     strategy:
       matrix:
         config:
-          - os: ubuntu-22.04
+          - name: linux-amd64
+            os: ubuntu-24.04
             kernel_path: "../app/kernel-linux/SiYuan-Kernel"
-            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            build_mode: "-buildmode=pie"
+            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod -extldflags -static-pie"
             electron_args: "dist-linux"
             goos: "linux"
             goarch: "amd64"
             cc_path: "x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
-            suffix: "linux.tar.gz"
-          - os: ubuntu-22.04
-            name: ubuntu build linux.AppImage
-            kernel_path: "../app/kernel-linux/SiYuan-Kernel"
-            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
-            electron_args: "dist-linux"
-            goos: "linux"
-            goarch: "amd64"
-            cc_path: "x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
-            suffix: "linux.AppImage"
-          - os: ubuntu-22.04
+            artifact_glob: "siyuan-*-linux.*"
+            artifact_count: 4
+          - name: linux-arm64
+            os: ubuntu-24.04
             kernel_path: "../app/kernel-linux-arm64/SiYuan-Kernel"
-            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            build_mode: "-buildmode=pie"
+            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod -extldflags -static-pie"
             electron_args: "dist-linux-arm64"
             goos: "linux"
             goarch: "arm64"
             cc_path: "aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc"
-            suffix: "linux-arm64.tar.gz"
-          - os: macos-latest
+            artifact_glob: "siyuan-*-linux-arm64.*"
+            artifact_count: 4
+          - name: mac-amd64
+            os: macos-latest
             kernel_path: "../app/kernel-darwin/SiYuan-Kernel"
+            build_mode: ""
             build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
             electron_args: "dist-darwin"
             goos: "darwin"
             goarch: "amd64"
-            suffix: "mac.dmg"
-          - os: macos-latest
+            artifact_glob: "siyuan-*-mac.dmg"
+            artifact_count: 1
+          - name: mac-arm64
+            os: macos-latest
             kernel_path: "../app/kernel-darwin-arm64/SiYuan-Kernel"
+            build_mode: ""
             build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
             electron_args: "dist-darwin-arm64"
             goos: "darwin"
             goarch: "arm64"
-            suffix: "mac-arm64.dmg"
-          - os: windows-latest
+            artifact_glob: "siyuan-*-mac-arm64.dmg"
+            artifact_count: 1
+          - name: windows-amd64
+            os: windows-latest
             kernel_path: "../app/kernel/SiYuan-Kernel.exe"
+            build_mode: ""
             build_args: "-s -w -H=windowsgui -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
             electron_args: "dist"
             goos: "windows"
-            gobin: "bin"
-            mingwsys: "MINGW64"
             goarch: "amd64"
-            suffix: "win.exe"
+            gobin: "bin"
+            artifact_glob: "siyuan-*-win.exe"
+            artifact_count: 1
+          - name: windows-arm64
+            os: windows-latest
+            kernel_path: "../app/kernel-arm64/SiYuan-Kernel.exe"
+            build_mode: ""
+            build_args: "-s -w -H=windowsgui -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist-arm64"
+            goos: "windows"
+            goarch: "arm64"
+            gobin: "bin"
+            artifact_glob: "siyuan-*-win-arm64.exe"
+            artifact_count: 1
 
     steps:
       - uses: actions/checkout@v4
         with:
           path: siyuan-note
 
-      - name: clone origin and apply patches
+      - name: Clone upstream and apply patches
         shell: bash
         run: |
           set -euo pipefail
@@ -80,92 +139,96 @@ jobs:
           fi
 
           mkdir -p "${workspace}/go"
-          cd "${workspace}/siyuan-note/"
-
-          git clone --branch "${{ github.event.inputs.version }}" --depth=1 https://github.com/siyuan-note/siyuan.git
+          cd "${workspace}/siyuan-note"
+          git clone --branch "${{ needs.prepare.outputs.version }}" --depth=1 https://github.com/siyuan-note/siyuan.git
           cd siyuan
 
-          git apply "${workspace}/siyuan-note/patches/siyuan/disable-update.patch"
-          git apply "${workspace}/siyuan-note/patches/siyuan/default-config.patch"
-          git apply "${workspace}/siyuan-note/patches/siyuan/mock-vip-user.patch"
-          git apply "${workspace}/siyuan-note/patches/siyuan/hide-account-entry.patch"
+          for patch in "${workspace}"/siyuan-note/patches/siyuan/*.patch; do
+            git apply "${patch}"
+          done
 
-          git status
-
-      - name: Set up Cross Compilation Toolchains for Linux
-        if: contains( matrix.config.goos, 'linux')
+      - name: Set up Linux cross compiler
+        if: matrix.config.goos == 'linux'
         run: |
+          set -euo pipefail
           sudo mkdir -p /usr/local/musl
-      
+          archive="${{ matrix.config.goarch }}-musl.tgz"
           if [ "${{ matrix.config.goarch }}" = "amd64" ]; then
-            wget https://github.com/appdev/musl-archive/releases/download/latest/x86_64-linux-musl-cross.tgz
-            sudo tar -xzf x86_64-linux-musl-cross.tgz -C /usr/local/musl
-          elif [ "${{ matrix.config.goarch }}" = "arm64" ]; then
-            wget https://github.com/appdev/musl-archive/releases/download/latest/aarch64-linux-musl-cross.tgz
-            sudo tar -xzf aarch64-linux-musl-cross.tgz -C /usr/local/musl
+            url="https://github.com/appdev/musl-archive/releases/download/latest/x86_64-linux-musl-cross.tgz"
+          else
+            url="https://github.com/appdev/musl-archive/releases/download/latest/aarch64-linux-musl-cross.tgz"
           fi
+          curl -fL "${url}" -o "${archive}"
+          sudo tar -xzf "${archive}" -C /usr/local/musl
+          echo "CC=/usr/local/musl/${{ matrix.config.cc_path }}" >> "${GITHUB_ENV}"
 
-      - name: Set up MingGW
+      - name: Set up MSYS2
+        if: matrix.config.goos == 'windows'
         uses: msys2/setup-msys2@v2
-        if: contains( matrix.config.goos, 'windows')
         with:
           install: p7zip mingw-w64-x86_64-lua
 
-      - name: Set up TDM-GCC
-        run: msys2 -c "bash siyuan-note/siyuan/scripts/get-tdm-gcc.sh tdm https://github.com/jmeubank/tdm-gcc/releases/download/v10.3.0-tdm-1/tdm-gcc-10.3.0.exe" && echo "CC=${{ github.workspace }}/tdm/bin/gcc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        if: contains( matrix.config.goarch, '386')
-        working-directory: ${{ github.workspace }}
+      - name: Set up llvm-mingw for Windows arm64
+        if: matrix.config.name == 'windows-arm64'
+        shell: pwsh
+        run: |
+          $archive = "$env:RUNNER_TEMP/llvm-mingw.zip"
+          $destination = "$env:RUNNER_TEMP/llvm-mingw"
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-x86_64.zip" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $destination
+          $toolchain = Get-ChildItem $destination -Directory | Select-Object -First 1
+          $bin = Join-Path $toolchain.FullName bin
+          $cc = Join-Path $bin aarch64-w64-mingw32-gcc.exe
+          & $cc --version
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CC=$cc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: ${{ github.workspace }}/siyuan-note/siyuan/kernel/go.mod
           cache-dependency-path: "**/*.sum"
+
       - run: go version
 
       - name: Set up goversioninfo
-        run: go get github.com/josephspurrier/goversioninfo/cmd/goversioninfo && go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo
-        if: contains( matrix.config.goos, 'windows')
+        if: matrix.config.goos == 'windows'
+        run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
         env:
-          GO111MODULE: on
-          CGO_ENABLED: 1
-          GOOS: ${{ matrix.config.goos }}
           GOPATH: ${{ github.workspace }}/go
-          GOARCH: ${{ matrix.config.goarch }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
-      - name: Install Node pnpm
-        run: npm install -g ${{ github.event.inputs.packageManager }}
+      - name: Install pnpm
+        run: npm install -g ${{ needs.prepare.outputs.package_manager }}
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
-      - name: Install Node Dependencies
+      - name: Install Node dependencies
         run: pnpm install --no-frozen-lockfile
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
-      - name: Building UI
+      - name: Install Electron binary
+        run: pnpm run install:electron
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Build UI
         run: pnpm run build
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
-      - name: Generate Icon Resource and Properties/Version Info For Windows
-        run: ${{ github.workspace }}\go\${{ matrix.config.gobin }}\goversioninfo -platform-specific=true -icon="resource\icon.ico" -manifest="resource\goversioninfo.exe.manifest"
-        if: contains( matrix.config.goos, 'windows')
+      - name: Generate Windows version info
+        if: matrix.config.goos == 'windows'
+        run: ${{ github.workspace }}\go\${{ matrix.config.gobin }}\goversioninfo.exe -platform-specific=true -icon="resource\icon.ico" -manifest="resource\goversioninfo.exe.manifest"
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
 
-      - name: Clean Build Directories
-        if: contains( matrix.config.goos, 'linux')
+      - name: Build Kernel
+        shell: bash
         run: |
-          rm -rf app/build
-          rm -rf app/kernel-linux
-          rm -rf app/kernel-linux-arm64
-        working-directory: ${{ github.workspace }}/siyuan-note/siyuan
-
-      - name: Building Kernel
-        run: go build --tags fts5 -o "${{ matrix.config.kernel_path }}" -v -ldflags "${{ matrix.config.build_args }}"
+          mkdir -p "$(dirname "${{ matrix.config.kernel_path }}")"
+          go build ${{ matrix.config.build_mode }} --tags "fts5 sqlcipher" -o "${{ matrix.config.kernel_path }}" -v -ldflags "${{ matrix.config.build_args }}"
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
         env:
           GO111MODULE: on
@@ -174,29 +237,101 @@ jobs:
           GOPATH: ${{ github.workspace }}/go
           GOARCH: ${{ matrix.config.goarch }}
           GOPROXY: https://proxy.golang.org,direct
-          CC: ${{ runner.os == 'Linux' && format('/usr/local/musl/{0}', matrix.config.cc_path) || '' }}
 
-      - name: Building Electron
+      - name: Verify Linux kernel portability
+        if: matrix.config.goos == 'linux'
+        run: |
+          file "${{ matrix.config.kernel_path }}"
+          if readelf -l "${{ matrix.config.kernel_path }}" | grep -q "Requesting program interpreter"; then
+            echo "Linux kernel unexpectedly requires a dynamic program interpreter" >&2
+            exit 1
+          fi
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
+
+      - name: Install RPM build tools
+        if: matrix.config.goos == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Add Windows elevator
+        if: matrix.config.goos == 'windows'
+        shell: bash
+        run: |
+          if [ "${{ matrix.config.goarch }}" = "arm64" ]; then
+            cp app/elevator/elevator-arm64.exe app/kernel-arm64/elevator.exe
+          else
+            cp app/elevator/elevator-amd64.exe app/kernel/elevator.exe
+          fi
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan
+
+      - name: Build Electron app
         run: pnpm run ${{ matrix.config.electron_args }}
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
-      - uses: joutvhu/get-release@v1
-        id: get_current_release
-        with:
-          tag_name: ${{ github.event.inputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify generated artifacts
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(${{ matrix.config.artifact_glob }})
+          if [ "${#files[@]}" -ne "${{ matrix.config.artifact_count }}" ]; then
+            printf "Expected %s artifacts, found %s\n" "${{ matrix.config.artifact_count }}" "${#files[@]}" >&2
+            printf "%s\n" "${files[@]}" >&2
+            exit 1
+          fi
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app/build
 
-      - name: Upload Electron App
-        uses: ncipollo/release-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage desktop artifacts
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: ${{ github.workspace }}/siyuan-note/siyuan/app/build/siyuan-*-${{ matrix.config.suffix }}
-          name: siyuan-unlock-${{ github.event.inputs.version }}-${{ matrix.config.suffix }}
+          name: desktop-${{ matrix.config.name }}
+          path: ${{ github.workspace }}/siyuan-note/siyuan/app/build/${{ matrix.config.artifact_glob }}
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify desktop release and generate checksums
+        env:
+          VERSION_TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION_TAG#v}"
+          cd release
+          expected=(
+            "siyuan-${version}-linux.AppImage"
+            "siyuan-${version}-linux.deb"
+            "siyuan-${version}-linux.rpm"
+            "siyuan-${version}-linux.tar.gz"
+            "siyuan-${version}-linux-arm64.AppImage"
+            "siyuan-${version}-linux-arm64.deb"
+            "siyuan-${version}-linux-arm64.rpm"
+            "siyuan-${version}-linux-arm64.tar.gz"
+            "siyuan-${version}-mac.dmg"
+            "siyuan-${version}-mac-arm64.dmg"
+            "siyuan-${version}-win.exe"
+            "siyuan-${version}-win-arm64.exe"
+          )
+          for artifact in "${expected[@]}"; do
+            test -f "${artifact}" || {
+              echo "Missing ${artifact}" >&2
+              exit 1
+            }
+          done
+          sha256sum "${expected[@]}" > SHA256SUMS.txt
+
+      - name: Publish desktop release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ github.token }}
+          tag: ${{ needs.prepare.outputs.version }}
+          artifacts: release/*
           allowUpdates: true
+          replacesArtifacts: true
           omitBody: true
           omitName: true
-          tag: ${{ github.event.inputs.version }}
-          replacesArtifacts: true
