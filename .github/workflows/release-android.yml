@@ -48,6 +48,7 @@ jobs:
           cd siyuan-android
 
           git apply --ignore-whitespace --verbose ${{ github.workspace }}/siyuan-note/patches/siyuan-android/debug-build.patch
+          sed -i '/maven.aliyun.com/d' build.gradle
 
           mkdir -p app/src/main/assets/
           mkdir -p app/libs/
