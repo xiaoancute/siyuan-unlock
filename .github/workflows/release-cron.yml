@@ -35,14 +35,12 @@ jobs:
 
           grep -Fxq SHA256SUMS.txt <<< "${assets}" && desktop=false || desktop=true
           grep -Eq "\.apk$" <<< "${assets}" && android=false || android=true
-          grep -Eq "\.ipa$" <<< "${assets}" && ios=false || ios=true
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "package_manager=${package_manager}" >> "${GITHUB_OUTPUT}"
           echo "new_release=${new_release}" >> "${GITHUB_OUTPUT}"
           echo "desktop=${desktop}" >> "${GITHUB_OUTPUT}"
           echo "android=${android}" >> "${GITHUB_OUTPUT}"
-          echo "ios=${ios}" >> "${GITHUB_OUTPUT}"
 
       - name: Build missing desktop assets
         if: steps.release.outputs.desktop == 'true'
@@ -55,12 +53,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run release-android.yml --ref "${GITHUB_REF_NAME}" -f version="${{ steps.release.outputs.version }}" -f packageManager="${{ steps.release.outputs.package_manager }}"
-
-      - name: Build missing iOS asset
-        if: steps.release.outputs.ios == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release-ios.yml --ref "${GITHUB_REF_NAME}" -f version="${{ steps.release.outputs.version }}" -f packageManager="${{ steps.release.outputs.package_manager }}"
 
       - name: Build new Docker release
         if: steps.release.outputs.new_release == 'true'
