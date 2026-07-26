@@ -4,51 +4,115 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "release version/tag"
-        required: true
-      packageManager:
-        description: "pnpm@x.x.x"
-        required: true
+        description: "release version/tag (e.g. v3.7.3); blank uses latest upstream siyuan release"
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["CD For SiYuan Unlock"]
+    types:
+      - completed
+    branches:
+      - master
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: ${{ matrix.config.os }}
-    strategy:
-      matrix:
-        config:
-          - os: ubuntu-22.04
-            kernel_path: "../../../siyuan-android/app/libs/kernel.aar"
-
+  prepare:
+    runs-on: ubuntu-24.04
+    # Only act on the desktop workflow succeeding; ignore manual runs here (handled below).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      package_manager: ${{ steps.metadata.outputs.package_manager }}
+      should_run: ${{ steps.metadata.outputs.should_run }}
     steps:
       - uses: actions/checkout@v4
         with:
           path: siyuan-note
 
-      - name: clone origin and apply patches
+      - name: Resolve upstream release and validate patches
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          mkdir -p ${{ github.workspace }}/go
-          cd ${{ github.workspace }}/siyuan-note/
+          set -euo pipefail
 
-          git clone --branch ${{ github.event.inputs.version }} --depth=1 https://github.com/siyuan-note/siyuan.git
+          # Manual run: honor the requested version or fall back to upstream latest.
+          # workflow_run: resolve to the desktop release that just got published,
+          # i.e. the upstream latest siyuan tag.
+          version="${REQUESTED_VERSION}"
+          if [ -z "${version}" ]; then
+            version="$(gh api repos/siyuan-note/siyuan/releases/latest --jq .tag_name)"
+          fi
+
+          # The siyuan-android repo keeps its tags in lockstep with siyuan; bail
+          # out if the matching android tag is missing — there is nothing to build.
+          if ! gh api "repos/siyuan-note/siyuan-android/tags" --paginate --jq '.[].name' \
+               | grep -Fxq "${version}"; then
+            echo "siyuan-android has no matching tag '${version}' — skipping android build" >&2
+            echo "should_run=false"  >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git clone --branch "${version}" --depth=1 https://github.com/siyuan-note/siyuan.git upstream
+
+          package_version="$(jq -r .version upstream/app/package.json)"
+          package_manager="$(jq -r .packageManager upstream/app/package.json)"
+          if [ "${version}" != "v${package_version}" ]; then
+            echo "Tag ${version} does not match app/package.json version ${package_version}" >&2
+            exit 1
+          fi
+
+          # Reuse the same patches the desktop build applies to siyuan.
+          for patch in siyuan-note/patches/siyuan/*.patch; do
+            git -C upstream apply --check "${GITHUB_WORKSPACE}/${patch}"
+          done
+
+          # Skip if an APK for this version is already published to the matching release
+          # (avoids duplicate uploads when both a manual run and a workflow_run fire).
+          if gh release view "${version}" >/dev/null 2>&1 \
+             && gh release view "${version}" --json assets --jq '.assets[].name' \
+                | grep -Fxq "siyuan-unlock-${version}-android-arm64.apk"; then
+            echo "APK already present in release ${version} — skipping" >&2
+            echo "should_run=false"  >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_run=true"   >> "${GITHUB_OUTPUT}"
+          fi
+
+          echo "version=${version}"          >> "${GITHUB_OUTPUT}"
+          echo "package_manager=${package_manager}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: siyuan-note
+
+      - name: Clone upstream and apply patches
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ github.workspace }}/go"
+          cd "${{ github.workspace }}/siyuan-note/"
+
+          git clone --branch "${{ needs.prepare.outputs.version }}" --depth=1 https://github.com/siyuan-note/siyuan.git
           cd siyuan
-
-          git apply ${{ github.workspace }}/siyuan-note/patches/siyuan/disable-update.patch
-          git apply ${{ github.workspace }}/siyuan-note/patches/siyuan/default-config.patch
-          git apply ${{ github.workspace }}/siyuan-note/patches/siyuan/mock-vip-user.patch
-          git apply ${{ github.workspace }}/siyuan-note/patches/siyuan/hide-account-entry.patch
-
+          git apply "${{ github.workspace }}/siyuan-note/patches/siyuan/disable-update.patch"
+          git apply "${{ github.workspace }}/siyuan-note/patches/siyuan/default-config.patch"
+          git apply "${{ github.workspace }}/siyuan-note/patches/siyuan/mock-vip-user.patch"
+          git apply "${{ github.workspace }}/siyuan-note/patches/siyuan/hide-account-entry.patch"
           git status
 
           cd ..
-
-          git clone --branch ${{ github.event.inputs.version }} --depth=1 https://github.com/siyuan-note/siyuan-android.git
+          git clone --branch "${{ needs.prepare.outputs.version }}" --depth=1 https://github.com/siyuan-note/siyuan-android.git
           cd siyuan-android
-
-          git apply --ignore-whitespace --verbose ${{ github.workspace }}/siyuan-note/patches/siyuan-android/debug-build.patch
-          sed -i '/maven.aliyun.com/d' build.gradle
+          git apply --ignore-whitespace --verbose \
+            "${{ github.workspace }}/siyuan-note/patches/siyuan-android/debug-build.patch"
 
           mkdir -p app/src/main/assets/
           mkdir -p app/libs/
@@ -65,15 +129,15 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install Node pnpm
-        run: npm install -g ${{ github.event.inputs.packageManager }}
+      - name: Install pnpm
+        run: npm install -g ${{ needs.prepare.outputs.package_manager }}
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
-      - name: Install Node Dependencies
+      - name: Install Node dependencies
         run: pnpm install --no-frozen-lockfile
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
-      - name: Building UI
+      - name: Build UI
         run: pnpm run build
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
 
@@ -83,57 +147,76 @@ jobs:
           go install golang.org/x/mobile/cmd/gomobile@latest
           gomobile init
 
-      - name: Set up java
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
           cache: "gradle"
 
-      - name: Building Android Kernel
+      - name: Build Android Kernel
         run: |
-          gomobile bind --tags fts5 -androidapi 21 -target='android/arm64'  -ldflags '-s -w' -v -o "${{ matrix.config.kernel_path }}" ./
-          ls -la "${{ matrix.config.kernel_path }}"
+          gomobile bind --tags fts5 -androidapi 21 -target='android/arm64' -ldflags '-s -w' -v \
+            -o "${{ github.workspace }}/siyuan-note/siyuan-android/app/libs/kernel.aar" ./
+          ls -la "${{ github.workspace }}/siyuan-note/siyuan-android/app/libs/kernel.aar"
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel/mobile
         env:
           GO111MODULE: on
           CGO_ENABLED: 1
 
-      - name: android assets
+      - name: Bundle Android assets
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app/
         run: |
-          zip -r ${{ github.workspace }}/siyuan-note/siyuan-android/app/src/main/assets/app.zip ./appearance ./guide ./stage ./changelogs
+          zip -r \
+            "${{ github.workspace }}/siyuan-note/siyuan-android/app/src/main/assets/app.zip" \
+            ./appearance ./guide ./stage ./changelogs
 
-      - name: Decode Keystore
-        id: decode_keystore
+      - name: Decode keystore
         uses: timheuer/base64-to-file@v1.2
         with:
           fileName: "siyuan.jks"
           fileDir: ${{ github.workspace }}/siyuan-note/siyuan-android/keystore
           encodedString: ${{ secrets.KEYSTORE }}
 
-      - name: Building Android
+      - name: Build Android APK
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan-android
         run: |
-          chmod 777 ./gradlew
+          chmod +x ./gradlew
           ./gradlew :app:assembleRelease
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
 
-      - uses: joutvhu/get-release@v1
-        id: get_current_release
+      - name: Stage APK
+        id: apk
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          src_dir="${{ github.workspace }}/siyuan-note/siyuan-android/app/build/outputs/apk/googleplay/release"
+          ls -la "${src_dir}"
+
+          src="$(find "${src_dir}" -name 'siyuan-*.apk' -type f | head -1)"
+          if [ -z "${src}" ]; then
+            echo "No APK found under ${src_dir}" >&2
+            exit 1
+          fi
+
+          # ncipollo/release-action uploads by original filename, so stage the
+          # APK with the desired asset name before uploading.
+          dest_dir="${{ github.workspace }}/release-assets"
+          mkdir -p "${dest_dir}"
+          dest="${dest_dir}/siyuan-unlock-${version}-android-arm64.apk"
+          cp "${src}" "${dest}"
+          echo "path=${dest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish APK to release
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: ${{ github.event.inputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: List generated APK files
-        run: ls -la ${{ github.workspace }}/siyuan-note/siyuan-android/app/build/outputs/apk/googleplay/release/
-      - name: Upload Android
-        uses: shogo82148/actions-upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_current_release.outputs.upload_url }}
-          asset_name: siyuan-unlock-${{ github.event.inputs.version }}-android-arm64.apk
-          asset_path: ${{ github.workspace }}/siyuan-note/siyuan-android/app/build/outputs/apk/googleplay/release/siyuan-*.apk
-          asset_content_type: application/octet-stream
+          token: ${{ github.token }}
+          tag: ${{ needs.prepare.outputs.version }}
+          artifacts: ${{ steps.apk.outputs.path }}
+          artifactContentType: application/vnd.android.package-archive
+          allowUpdates: true
+          replacesArtifacts: true
+          omitBody: true
+          omitName: true
+          makeLatest: false
