@@ -214,6 +214,8 @@ jobs:
       - name: Install Electron binary
         run: pnpm run install:electron
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: Build UI
         run: pnpm run build
